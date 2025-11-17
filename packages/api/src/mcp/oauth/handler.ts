@@ -3,11 +3,15 @@ import { logger } from '@librechat/data-schemas';
 import {
   registerClient,
   startAuthorization,
-  exchangeAuthorization,
+  // exchangeAuthorization, // so this is what is failing... the dang library again
   discoverAuthorizationServerMetadata,
   discoverOAuthProtectedResourceMetadata,
 } from '@modelcontextprotocol/sdk/client/auth.js';
-import { OAuthMetadataSchema } from '@modelcontextprotocol/sdk/shared/auth.js';
+import {
+  OAuthErrorResponseSchema,
+  OAuthMetadataSchema,
+  OAuthTokensSchema,
+} from '@modelcontextprotocol/sdk/shared/auth.js';
 import type { MCPOptions } from 'librechat-data-provider';
 import type { FlowStateManager } from '~/flow/manager';
 import type {
@@ -18,7 +22,78 @@ import type {
   OAuthMetadata,
 } from './types';
 import { sanitizeUrlForLogging } from '~/mcp/utils';
+export async function parseErrorResponse(input) {
+  const statusCode = input instanceof Response ? input.status : undefined;
+  const body = input instanceof Response ? await input.text() : input;
+  try {
+    const result = OAuthErrorResponseSchema.parse(JSON.parse(body));
+    const { error_description } = result;
+    // const errorClass = OAUTH_ERRORS[error] || ServerError;
+    return new Error(error_description || '');
+  } catch (error) {
+    // Not a valid OAuth error response, but try to inform the user of the raw data anyway
+    const errorMessage = `${statusCode ? `HTTP ${statusCode}: ` : ''}Invalid OAuth error response: ${error}. Raw body: ${body}`;
+    return new Error(errorMessage);
+  }
+}
+function applyBasicAuth(clientId, clientSecret, headers) {
+  if (!clientSecret) {
+    throw new Error('client_secret_basic authentication requires a client_secret');
+  }
+  const credentials = btoa(`${clientId}:${clientSecret}`);
+  headers.set('Authorization', `Basic ${credentials}`);
+}
+/**
+ * Applies POST body authentication (RFC 6749 Section 2.3.1)
+ */
+function applyPostAuth(clientId, clientSecret, params) {
+  params.set('client_id', clientId);
+  if (clientSecret) {
+    params.set('client_secret', clientSecret);
+  }
+}
+/**
+ * Applies public client authentication (RFC 6749 Section 2.1)
+ */
+function applyPublicAuth(clientId, params) {
+  params.set('client_id', clientId);
+}
 
+function applyClientAuthentication(method, clientInformation, headers, params) {
+  const { client_id, client_secret } = clientInformation;
+  switch (method) {
+    case 'client_secret_basic':
+      applyBasicAuth(client_id, client_secret, headers);
+      return;
+    case 'client_secret_post':
+      applyPostAuth(client_id, client_secret, params);
+      return;
+    case 'none':
+      applyPublicAuth(client_id, params);
+      return;
+    default:
+      throw new Error(`Unsupported client authentication method: ${method}`);
+  }
+}
+function selectClientAuthMethod(clientInformation, supportedMethods) {
+  const hasClientSecret = clientInformation.client_secret !== undefined;
+  // If server doesn't specify supported methods, use RFC 6749 defaults
+  if (supportedMethods.length === 0) {
+    return hasClientSecret ? 'client_secret_post' : 'none';
+  }
+  // Try methods in priority order (most secure first)
+  if (hasClientSecret && supportedMethods.includes('client_secret_basic')) {
+    return 'client_secret_basic';
+  }
+  if (hasClientSecret && supportedMethods.includes('client_secret_post')) {
+    return 'client_secret_post';
+  }
+  if (supportedMethods.includes('none')) {
+    return 'none';
+  }
+  // Fallback: use what we have
+  return hasClientSecret ? 'client_secret_post' : 'none';
+}
 /** Type for the OAuth metadata from the SDK */
 type SDKOAuthMetadata = Parameters<typeof registerClient>[1]['metadata'];
 
@@ -396,6 +471,81 @@ export class MCPOAuthHandler {
         );
         resource = undefined;
       }
+      const exchangeAuthorization = async (
+        authorizationServerUrl,
+        {
+          metadata,
+          clientInformation,
+          authorizationCode,
+          codeVerifier,
+          redirectUri,
+          resource,
+          addClientAuthentication,
+          fetchFn,
+        },
+      ) => {
+        let _a;
+        const grantType = 'authorization_code';
+        const tokenUrl = (
+          metadata === null || metadata === void 0 ? void 0 : metadata.token_endpoint
+        )
+          ? new URL(metadata.token_endpoint)
+          : new URL('/token', authorizationServerUrl);
+        if (
+          (metadata === null || metadata === void 0 ? void 0 : metadata.grant_types_supported) &&
+          !metadata.grant_types_supported.includes(grantType)
+        ) {
+          throw new Error(`Incompatible auth server: does not support grant type ${grantType}`);
+        }
+        // Exchange code for tokens
+        const headers = new Headers({
+          'Content-Type': 'application/x-www-form-urlencoded',
+          Accept: 'application/json',
+        });
+        const params = new URLSearchParams({
+          grant_type: grantType,
+          code: authorizationCode,
+          code_verifier: codeVerifier,
+          redirect_uri: String(redirectUri),
+        });
+        if (addClientAuthentication) {
+          addClientAuthentication(headers, params, authorizationServerUrl, metadata);
+        } else {
+          // Determine and apply client authentication method
+          const supportedMethods =
+            (_a =
+              metadata === null || metadata === void 0
+                ? void 0
+                : metadata.token_endpoint_auth_methods_supported) !== null && _a !== void 0
+              ? _a
+              : [];
+          const authMethod = selectClientAuthMethod(clientInformation, supportedMethods);
+          applyClientAuthentication(authMethod, clientInformation, headers, params);
+        }
+        if (resource) {
+          params.set('resource', resource.href);
+        }
+        const response = await (fetchFn !== null && fetchFn !== void 0 ? fetchFn : fetch)(
+          tokenUrl,
+          {
+            method: 'POST',
+            headers,
+            body: params,
+          },
+        );
+        if (!response.ok) {
+          throw await parseErrorResponse(response);
+        }
+        const data = await response.json();
+
+        const parseData = {
+          ...data,
+          expires_in:
+            typeof data.expires_in === 'string' ? parseInt(data.expires_in) : data.expires_in,
+        };
+        logger.debug('[MCPOAuth] DATA:', parseData.expires_in);
+        return OAuthTokensSchema.parse(parseData);
+      };
 
       const tokens = await exchangeAuthorization(metadata.serverUrl, {
         redirectUri: metadata.clientInfo.redirect_uris?.[0] || this.getDefaultRedirectUri(),
